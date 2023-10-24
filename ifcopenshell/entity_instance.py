@@ -16,6 +16,9 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.        #
 #                                                                             #
 ###############################################################################
+
+from __future__ import absolute_import
+from __future__ import division
 from __future__ import print_function
 
 import functools
@@ -26,13 +29,30 @@ from . import ifcopenshell_wrapper
 
 try:
     import logging
-    log = logging.getLogger(__name__)
 except ImportError as e:
-    log = type('logger', (object,), {'exception': lambda s: print(s)})
+    logging = type('logger', (object,), {'exception': staticmethod(lambda s: print(s))})
 
 
 class entity_instance(object):
+    """
+    This is the base python class for all IFC objects.
+
+    An instantiated entity_instance will have methods of Python and the IFC class itself.
+
+    example:
+
+    ifc_file = ifcopenshell.open(file_path)
+    products = ifc_file.by_type("IfcProduct")
+
+    print(products[0].__class__)
+    >>> <class 'ifcopenshell.entity_instance.entity_instance'>
+
+    print(products[0].Representation)
+    >>> #423=IfcProductDefinitionShape($,$,(#409,#421))
+    """
     def __init__(self, e):
+        if isinstance(e, tuple):
+            e = ifcopenshell_wrapper.new_IfcBaseClass(*e)
         super(entity_instance, self).__setattr__('wrapped_data', e)
 
     def __getattr__(self, name):
@@ -58,14 +78,18 @@ class entity_instance(object):
 
     @staticmethod
     def wrap_value(v):
-        wrap = lambda e: entity_instance(e)
-        is_instance = lambda e: isinstance(e, ifcopenshell_wrapper.entity_instance)
+        def wrap(e): return entity_instance(e)
+
+        def is_instance(e): return isinstance(e, ifcopenshell_wrapper.entity_instance)
+
         return entity_instance.walk(is_instance, wrap, v)
 
     @staticmethod
     def unwrap_value(v):
-        unwrap = lambda e: e.wrapped_data
-        is_instance = lambda e: isinstance(e, entity_instance)
+        def unwrap(e): return e.wrapped_data
+
+        def is_instance(e): return isinstance(e, entity_instance)
+
         return entity_instance.walk(is_instance, unwrap, v)
 
     def attribute_type(self, attr):
@@ -79,20 +103,38 @@ class entity_instance(object):
         self[self.wrapped_data.get_argument_index(key)] = value
 
     def __getitem__(self, key):
+        if key < 0 or key >= len(self):
+            raise IndexError("Attribute index {} out of range for instance of type {}".format(key, self.is_a()))
         return entity_instance.wrap_value(self.wrapped_data.get_argument(key))
 
     def __setitem__(self, idx, value):
+        attr_type = real_attr_type = self.attribute_type(idx).title().replace(' ', '')
+        real_attr_type = real_attr_type.replace('Derived', 'None')
+        attr_type = attr_type.replace('Binary', 'String')
+        attr_type = attr_type.replace('Enumeration', 'String')
+        
         if value is None:
-            self.wrapped_data.setArgumentAsNull(idx)
+            if attr_type != "Derived":
+                self.wrapped_data.setArgumentAsNull(idx)
         else:
-            attr_type = self.attribute_type(idx).title().replace(' ', '')
-            attr_type = attr_type.replace('Binary', 'String')
-            attr_type = attr_type.replace('Enumeration', 'String')
-            try:
-                if isinstance(value, unicode): value = value.encode("utf-8")
-            except:
-                pass
-            getattr(self.wrapped_data, "setArgumentAs%s" % attr_type)(idx, entity_instance.unwrap_value(value))
+            valid = attr_type != "Derived"
+            if valid:                 
+                try:
+                    if isinstance(value, unicode):
+                        value = value.encode("utf-8")
+                except BaseException:
+                    pass
+                    
+                try:
+                    if attr_type != "Derived":
+                        getattr(self.wrapped_data, "setArgumentAs%s" % attr_type)(idx, entity_instance.unwrap_value(value))
+                except BaseException as e:
+                    valid = False
+
+            if not valid:
+                raise ValueError("Expected %s for attribute %s.%s, got %r" % (
+                    real_attr_type, self.is_a(), self.attribute_name(idx), value))
+
         return value
 
     def __len__(self):
@@ -108,7 +150,8 @@ class entity_instance(object):
         return self.wrapped_data.id()
 
     def __eq__(self, other):
-        if type(self) != type(other): return False
+        if not isinstance(self, type(other)):
+            return False
         return self.wrapped_data == other.wrapped_data
 
     def __hash__(self):
@@ -117,22 +160,55 @@ class entity_instance(object):
     def __dir__(self):
         return sorted(set(itertools.chain(
             dir(type(self)),
-            self.wrapped_data.get_attribute_names(),
-            self.wrapped_data.get_inverse_attribute_names()
+            map(str, self.wrapped_data.get_attribute_names()),
+            map(str, self.wrapped_data.get_inverse_attribute_names())
         )))
 
-    def get_info(self):
-        _info = {}
-        try:
-            _info["id"] = self.id()
-            _info["type"] = self.is_a()
-        except:
-            log.exception("unhandled exception while getting id / type info on {}".format(self))
-        for i in range(len(self)):
+    def get_info(self, include_identifier=True, recursive=False, return_type=dict, ignore=()):
+        """
+        Return a dictionary of the entity_instance's properties (Python and IFC) and their values.
+
+        example:
+
+        ifc_file = ifcopenshell.open(file_path)
+        products = ifc_file.by_type("IfcProduct")
+        obj_info = products[0].get_info()
+        print(obj_info.keys())
+
+        >>> dict_keys(['Description', 'Name', 'BuildingAddress', 'LongName', 'GlobalId', 'ObjectPlacement', 'OwnerHistory', 'ObjectType',
+        >>> ...'ElevationOfTerrain', 'CompositionType', 'id', 'Representation', 'type', 'ElevationOfRefHeight'])
+        """
+        def _():
             try:
-                _info[self.attribute_name(i)] = self[i]
-            except:
-                log.exception("unhandled exception occured setting attribute name for {}".format(self))
-        return _info
+                if include_identifier:
+                    yield "id", self.id()
+                yield "type", self.is_a()
+            except BaseException:
+                logging.exception("unhandled exception while getting id / type info on {}".format(self))
+            for i in range(len(self)):
+                try:
+                    if self.wrapped_data.get_attribute_names()[i] in ignore:
+                        continue
+                    attr_value = self[i]
+                    if recursive:
+                        def is_instance(e): return isinstance(e, entity_instance)
+
+                        def get_info_(inst):
+                            # for ty in ignore:
+                            #     if inst.is_a(ty):
+                            #         return None
+                            return entity_instance.get_info(inst,
+                                                            include_identifier=include_identifier,
+                                                            recursive=recursive,
+                                                            return_type=return_type,
+                                                            ignore=ignore
+                                                            )
+
+                        attr_value = entity_instance.walk(is_instance, get_info_, attr_value)
+                    yield self.attribute_name(i), attr_value
+                except BaseException:
+                    logging.exception("unhandled exception occurred setting attribute name for {}".format(self))
+
+        return return_type(_())
 
     __dict__ = property(get_info)
